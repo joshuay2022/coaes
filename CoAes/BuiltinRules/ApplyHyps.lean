@@ -1,0 +1,44 @@
+/-
+Copyright (c) 2021 Jannis Limperg. All rights reserved.
+Released under Apache 2.0 license as described in the file LICENSE.
+Authors: Jannis Limperg
+-/
+module
+
+public import CoAes.Frontend.Attribute
+
+public section
+
+namespace CoAes.BuiltinRules
+
+open Lean
+open Lean.Meta
+
+meta def applyHyp (hyp : FVarId) (goal : MVarId) (md : TransparencyMode) :
+    BaseM RuleApplication := do
+  let (goals, #[step]) ← applyS goal (.fvar hyp) none md |>.run
+    | throwError "coaes: internal error in applyHyps: multiple steps"
+  return {
+    goals := goals.map λ mvarId => { diff := .empty goal mvarId }
+    postState := step.postState
+    scriptSteps? := #[step]
+    successProbability? := none
+  }
+
+@[coaes unsafe 75% tactic (rule_sets := [builtin])]
+meta def applyHyps : RuleTac := λ input =>
+  input.goal.withContext do
+    let lctx ← getLCtx
+    let md := input.options.applyHypsTransparency
+    let mut rapps := Array.mkEmpty lctx.decls.size
+    for localDecl in lctx do
+      if localDecl.isImplementationDetail then continue
+      let initialState ← saveState
+      try
+        let rapp ← applyHyp localDecl.fvarId input.goal md
+        rapps := rapps.push rapp
+      catch _ => continue
+      finally restoreState initialState
+    return ⟨rapps⟩
+
+end CoAes.BuiltinRules

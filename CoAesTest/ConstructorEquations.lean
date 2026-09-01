@@ -1,0 +1,28 @@
+/-
+Copyright (c) 2023 Jannis Limperg. All rights reserved.
+Released under Apache 2.0 license as described in the file LICENSE.
+Authors: Jannis Limperg
+-/
+
+import CoAes
+
+set_option coaes.check.all true
+
+-- From an equation where both sides contain only constructor applications
+-- and variables, CoAes should derive equations about the variables.
+
+example (h : Nat.zero = Nat.succ n) : False := by
+  coaes
+
+example (h : Nat.succ (Nat.succ n) = Nat.succ Nat.zero) : False := by
+  coaes
+
+example (h : (Nat.succ m, Nat.succ n) = (Nat.succ a, Nat.succ b)) :
+    m = a ∧ n = b := by
+  coaes
+
+structure MyProd (A B : Type _) where
+  toProd : A × B
+
+example (h : MyProd.mk (x, y) = .mk (a, b)) : x = a ∧ y = b := by
+  coaes

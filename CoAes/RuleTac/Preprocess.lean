@@ -1,0 +1,25 @@
+/-
+Copyright (c) 2023 Jannis Limperg. All rights reserved.
+Released under Apache 2.0 license as described in the file LICENSE.
+Authors: Jannis Limperg
+-/
+module
+
+public import CoAes.RuleTac.Basic
+public import CoAes.Script.SpecificTactics
+
+public section
+
+open Lean Lean.Meta
+
+namespace CoAes.RuleTac
+
+/--
+This `RuleTac` is applied once to the root goal, before any other rules are
+tried.
+-/
+def preprocess : RuleTac := RuleTac.ofSingleRuleTac λ input => do
+  let ((mvarId, _), steps) ← renameInaccessibleFVarsS input.goal |>.run
+  return (#[{ diff := .empty input.goal mvarId }], steps, none)
+
+end CoAes.RuleTac
