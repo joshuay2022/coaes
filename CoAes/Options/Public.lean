@@ -147,6 +147,15 @@ structure Options where
   `unfold` and succeed only if they close the goal.
   -/
   enableClosers := true
+  /--
+  Heartbeat budget for a single rule application, in the same unit as the
+  `maxHeartbeats` option (so `200000` corresponds to the default `maxHeartbeats`
+  budget). A rule that exceeds this budget counts as failed — the search
+  continues with the remaining rules — and is reported in a warning.
+  `0` means a tenth of the current `maxHeartbeats` budget; if `maxHeartbeats`
+  is `0` (unlimited), rule applications are unlimited as well.
+  -/
+  maxRuleHeartbeats : Nat := 0
   deriving Inhabited, BEq, Repr
 
 /--

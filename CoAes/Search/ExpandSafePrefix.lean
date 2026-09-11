@@ -71,15 +71,39 @@ mutual
     (← cref.get).goals.forM expandSafePrefixGoal
 end
 
-def expandSafePrefix : SearchM Q Bool := do
+/-- Outcome of expanding the safe prefix of the search tree. -/
+inductive SafePrefixExpansionResult
+  /-- The safe prefix was fully expanded. -/
+  | complete
+  /-- Expansion stopped at the `maxSafePrefixRuleApplications` limit. -/
+  | ruleLimit
+  /-- Expansion stopped because a resource limit (e.g. `maxHeartbeats`) was
+  reached. -/
+  | resourceLimit
+  deriving Inhabited, BEq
+
+def SafePrefixExpansionResult.isComplete : SafePrefixExpansionResult → Bool
+  | .complete => true
+  | _ => false
+
+def expandSafePrefix : SearchM Q SafePrefixExpansionResult := do
   coaes_trace[steps] "Expanding safe subtree of the root goal."
-  try
-    expandSafePrefixGoal (← getRootGoal) |>.run' {}
-    return true
-  catch e =>
-    if isSafeExpansionFailedException e then
-      return false
-    else
-      throw e
+  -- `tryCatchRuntimeEx` so that a resource limit (e.g. `maxHeartbeats`) hit
+  -- while expanding the safe prefix stops the expansion gracefully, like the
+  -- rule application limit: whatever was expanded so far is kept and the
+  -- caller reports that the prefix is incomplete. Without this, the wrap-up
+  -- after an otherwise successful search would fail with a bare timeout and
+  -- the partial results (in particular the `coaes?` script) would be lost.
+  tryCatchRuntimeEx
+    (do expandSafePrefixGoal (← getRootGoal) |>.run' {}
+        return .complete)
+    (λ e => do
+      if isSafeExpansionFailedException e then
+        return .ruleLimit
+      else if isResourceLimitException e then
+        coaes_trace[steps] "Safe prefix expansion hit a resource limit: {e.toMessageData}"
+        return .resourceLimit
+      else
+        throw e)
 
 end CoAes

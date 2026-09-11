@@ -64,6 +64,12 @@ structure Stats where
   script : Nanos
   scriptGenerated : Option ScriptGenerated
   ruleStats : Array RuleStats
+  /--
+  Rules that failed during the search because they exceeded a resource limit
+  (heartbeats or recursion depth). Such rules are treated as ordinary failures
+  — the search continues with other rules — and are reported in a warning.
+  -/
+  resourceLimitedRules : Array DisplayRuleName
   deriving Inhabited
 
 namespace Stats
@@ -77,6 +83,7 @@ protected def empty : Stats where
   script := 0
   scriptGenerated := none
   ruleStats := #[]
+  resourceLimitedRules := #[]
 
 instance : EmptyCollection Stats :=
   ⟨Stats.empty⟩

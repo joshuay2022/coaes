@@ -27,6 +27,27 @@ namespace CoAes
 
 variable [CoAes.Queue Q]
 
+/-! ### Heartbeat budget distribution
+
+CoAes splits the ambient `maxHeartbeats` budget into slices rather than letting
+the search consume all of it. The wrap-up after the search (safe prefix
+expansion, proof extraction, script generation) then still has budget even
+when the search ran out of time, so its partial results are reported instead
+of lost; and since the slices add up to less than 100%, the elaboration that
+follows the `coaes` call is not starved either. -/
+
+/-- Percentage of the ambient heartbeat budget given to the proof search. -/
+def searchHeartbeatPercent := 60
+
+/-- Percentage of the ambient heartbeat budget given to safe prefix expansion. -/
+def safePrefixHeartbeatPercent := 10
+
+/-- Percentage of the ambient heartbeat budget given to proof extraction. -/
+def extractHeartbeatPercent := 10
+
+/-- Percentage of the ambient heartbeat budget given to script generation. -/
+def scriptHeartbeatPercent := 15
+
 partial def nextActiveGoal : SearchM Q GoalRef := do
   let some gref ← popGoal?
     | throwError "coaes/expandNextGoal: internal error: no active goals left"
@@ -130,15 +151,25 @@ def traceScript (completeProof : Bool) : SearchM Q Unit :=
   let options := (← read).options
   if ! options.generateScript then
     return
-  let (uscript, proofHasMVars) ←
-    if completeProof then extractScript else extractSafePrefixScript
-  uscript.checkIfEnabled
-  let rootGoal ← getRootMVarId
-  let rootState ← getRootMetaState
-  coaes_trace[script] "Unstructured script:{indentD $ toMessageData $ ← uscript.renderTacticSeq rootState rootGoal}"
-  let sscript? ← uscript.optimize proofHasMVars rootState rootGoal
-  checkAndTraceScript uscript sscript? rootState rootGoal options
-    (expectCompleteProof := completeProof) "coaes"
+  -- Script generation runs with a fresh heartbeat budget: the search may well
+  -- have exhausted the ambient one, and reporting the script the search
+  -- already found is exactly what is wanted in that case. If generation
+  -- itself exceeds the budget, report that instead of failing the tactic.
+  tryCatchRuntimeEx
+    (withHeartbeatBudget (← read).baseMaxHeartbeats scriptHeartbeatPercent do
+      let (uscript, proofHasMVars) ←
+        if completeProof then extractScript else extractSafePrefixScript
+      uscript.checkIfEnabled
+      let rootGoal ← getRootMVarId
+      let rootState ← getRootMetaState
+      coaes_trace[script] "Unstructured script:{indentD $ toMessageData $ ← uscript.renderTacticSeq rootState rootGoal}"
+      let sscript? ← uscript.optimize proofHasMVars rootState rootGoal
+      checkAndTraceScript uscript sscript? rootState rootGoal options
+        (expectCompleteProof := completeProof) "coaes")
+    (λ e => do
+      unless isResourceLimitException e do
+        throw e
+      logWarning m!"coaes: could not generate a tactic script because a resource limit (e.g. 'maxHeartbeats') was reached.")
 
 def traceTree : SearchM Q Unit := do
   (← (← getRootGoal).get).traceTree .tree
@@ -188,8 +219,8 @@ def treeHasProgress : TreeM Bool := do
   resultRef.get
 
 def throwCoAesEx (mvarId : MVarId) (remainingSafeGoals : Array MVarId)
-    (safePrefixExpansionSuccess : Bool) (msg? : Option MessageData) :
-    SearchM Q α := do
+    (safePrefixExpansion : SafePrefixExpansionResult)
+    (msg? : Option MessageData) : SearchM Q α := do
   if coaes.smallErrorMessages.get (← getOptions) then
     match msg? with
     | none => throwError "tactic 'coaes' failed"
@@ -202,10 +233,12 @@ def throwCoAesEx (mvarId : MVarId) (remainingSafeGoals : Array MVarId)
       else
         let gs := .joinSep (remainingSafeGoals.toList.map toMessageData) "\n\n"
         let suffix' :=
-          if safePrefixExpansionSuccess then
-            m!""
-          else
+          match safePrefixExpansion with
+          | .complete => m!""
+          | .ruleLimit =>
             m!"\nThe safe prefix was not fully expanded because the maximum number of rule applications ({maxRapps}) was reached."
+          | .resourceLimit =>
+            m!"\nThe safe prefix was not fully expanded because a resource limit (e.g. 'maxHeartbeats') was reached."
         m!"\nRemaining goals after safe rules:{indentD gs}{suffix'}"
     -- Copy-pasta from `Lean.Meta.throwTacticEx`
     match msg? with
@@ -225,9 +258,49 @@ def throwCoAesEx (mvarId : MVarId) (remainingSafeGoals : Array MVarId)
 -- sibling being unprovable, without the goal ever being expanded. So if we did
 -- not expand the safe rules after the fact, the tactic's output would be
 -- sensitive to minor changes in, e.g., rule priority.
+/--
+Marks every goal that is still un-normalised as normalised-without-changes.
+
+Proof and script extraction require that every goal in the tree has been
+normalised. Normally the search guarantees this, but when safe prefix
+expansion is interrupted (by the rule application limit or by a resource
+limit) it can leave freshly created goals un-normalised. Such a goal is simply
+used as it is; it ends up as one of the remaining goals of the `coaes` call.
+-/
+def normaliseRemainingGoals : SearchM Q Unit := do
+  let root := (← getTree).root
+  preTraverseDown
+    (λ gref => do
+      let g ← gref.get
+      if g.normalizationState matches .notNormal then
+        let (_, postState) ← g.runMetaMInParentState (pure ())
+        gref.modify (·.setNormalizationState (.normal g.preNormGoal postState #[]))
+      return true)
+    (λ _ => return true)
+    (λ _ => return true)
+    (.mvarCluster root)
+
 def handleNonfatalError (err : MessageData) : SearchM Q (Array MVarId) := do
-  let safeExpansionSuccess ← expandSafePrefix
-  let safeGoals ← extractSafePrefix
+  -- The search may have exhausted its heartbeat budget (that is one of the
+  -- reasons we end up here), so each wrap-up phase gets its own fresh slice of
+  -- the ambient budget. Otherwise reporting the results of a search that ran
+  -- out of time would itself run out of time and the partial results — in
+  -- particular the `coaes?` script — would be lost.
+  let base := (← read).baseMaxHeartbeats
+  let safeExpansionSuccess ←
+    withHeartbeatBudget base safePrefixHeartbeatPercent expandSafePrefix
+  unless safeExpansionSuccess.isComplete do
+    normaliseRemainingGoals
+  let safeGoals ←
+    -- Extracting the proof term for the safe prefix can also exceed a resource
+    -- limit. Report what we have (no safe goals) rather than failing.
+    tryCatchRuntimeEx
+      (withHeartbeatBudget base extractHeartbeatPercent extractSafePrefix)
+      λ e => do
+        unless isResourceLimitException e do
+          throw e
+        logWarning m!"coaes: could not extract the goals remaining after the safe rules because a resource limit (e.g. 'maxHeartbeats') was reached."
+        return #[]
   coaes_trace[proof] do
     match ← getProof? with
     | some proof =>
@@ -243,8 +316,12 @@ def handleNonfatalError (err : MessageData) : SearchM Q (Array MVarId) := do
     throwCoAesEx (← getRootMVarId) #[] safeExpansionSuccess "made no progress"
   if opts.warnOnNonterminal && coaes.warn.nonterminal.get (← getOptions) then
     logWarning m!"coaes: {err}"
-  if ! safeExpansionSuccess then
+  match safeExpansionSuccess with
+  | .complete => pure ()
+  | .ruleLimit =>
     logWarning m!"coaes: safe prefix was not fully expanded because the maximum number of rule applications ({(← read).options.maxSafePrefixRuleApplications}) was reached."
+  | .resourceLimit =>
+    logWarning m!"coaes: safe prefix was not fully expanded because a resource limit (e.g. 'maxHeartbeats') was reached."
   safeGoals.mapM (clearForwardImplDetailHyps ·)
 
 partial def searchLoop : SearchM Q (Array MVarId) :=
@@ -279,7 +356,24 @@ def search (goal : MVarId) (ruleSet? : Option LocalRuleSet := none)
   let ⟨Q, _⟩ := options.queue
   let go : SearchM _ _ := do
     show SearchM Q _ from
-    try searchLoop
+    try
+      -- If the overall `maxHeartbeats` budget (or the recursion depth limit)
+      -- is exhausted during the search, report the progress made so far —
+      -- like any other search limit — instead of failing with the resource
+      -- error. User interrupts are never caught. The wrap-up (safe prefix
+      -- expansion, script generation) runs with a fresh heartbeat budget.
+      tryCatchRuntimeEx
+        (withHeartbeatBudget (← read).baseMaxHeartbeats searchHeartbeatPercent
+          searchLoop) λ e => do
+        unless isResourceLimitException e do
+          throw e
+        let msg :=
+          if e.isMaxHeartbeat then
+            m!"failed to prove the goal: the search was stopped because the overall heartbeat budget was exhausted. Set option 'maxHeartbeats' to increase the limit."
+          else
+            m!"failed to prove the goal: the search was stopped because a resource limit was reached: {e.toMessageData}"
+        -- `handleNonfatalError` runs with a fresh heartbeat budget.
+        handleNonfatalError msg
     finally freeTree
   let ((goals, _, _), stats) ←
     go.run ruleSet options simpConfig simpConfigSyntax? goal |>.run stats

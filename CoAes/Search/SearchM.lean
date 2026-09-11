@@ -32,6 +32,12 @@ structure Context where
   ruleSet : LocalRuleSet
   normSimpContext : NormSimpContext
   options : CoAes.Options'
+  /--
+  The ambient `maxHeartbeats` budget when `coaes` was entered (`0` means
+  unlimited). CoAes splits this budget into slices for the search and for the
+  individual wrap-up phases; see `withHeartbeatBudget`.
+  -/
+  baseMaxHeartbeats : Nat := 0
   deriving Nonempty
 
 structure State (Q) [CoAes.Queue Q] where
@@ -93,7 +99,8 @@ protected def run (ruleSet : LocalRuleSet) (options : CoAes.Options')
     enabled := options.enableSimp
     useHyps := options.useSimpAll
   }
-  let ctx := { ruleSet, options, normSimpContext }
+  let baseMaxHeartbeats := (← show CoreM _ from read).maxHeartbeats
+  let ctx := { ruleSet, options, normSimpContext, baseMaxHeartbeats }
   let #[rootGoal] := (← t.root.get).goals
     | throwError "coaes: internal error: root mvar cluster does not contain exactly one goal."
   let state := {

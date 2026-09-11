@@ -42,5 +42,29 @@ where
             config.simpConfigSyntax? (← getStats)
         replaceMainGoal goals.toList
         modifyStats λ _ => stats
+        warnAboutResourceLimitedRules config stats goals
+
+  /--
+  Rules that hit a resource limit (e.g. `maxHeartbeats`) during the search
+  were treated as failed and the search continued without them. Report them,
+  so that a user of `coaes?` knows that the returned tactics were found
+  without these rules and can raise the limit if needed. The warning is shown
+  when a script was requested (`coaes?`) or when the search did not close the
+  goal.
+  -/
+  warnAboutResourceLimitedRules (config : Frontend.TacticConfig)
+      (stats : Stats) (goals : Array MVarId) : TacticM Unit := do
+    let rules := stats.resourceLimitedRules
+    if rules.isEmpty then
+      return
+    unless config.options.traceScript || ! goals.isEmpty do
+      return
+    let fmtRule : DisplayRuleName → MessageData
+      | .ruleName n => m!"{n.name}"
+      | .normSimp => m!"<norm simp>"
+      | .normUnfold => m!"<norm unfold>"
+    let rulesList :=
+      MessageData.joinSep (rules.toList.map fmtRule) ", "
+    logWarning m!"coaes: the following rules were treated as failed because they exceeded a resource limit (e.g. 'maxHeartbeats'): {rulesList}\nThe search continued without them, so the result may be incomplete. Set option 'maxRuleHeartbeats' to give each rule more time."
 
 end CoAes

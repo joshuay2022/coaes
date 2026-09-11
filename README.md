@@ -24,6 +24,16 @@ CoAes extends Aesop with:
   `simp only [...]` / `simp_all only [...]`, falling back to the exhaustive
   form only when the simple tactic does not reproduce the proof state.
 
+- **Resource limits never lose results.** A rule that exceeds a resource limit
+  (typically `maxHeartbeats`) counts as a failed rule: the search continues
+  with the other rules instead of aborting with a timeout error. The same holds
+  for the search as a whole — when the budget runs out, CoAes reports the
+  progress it made (including the `coaes?` script) rather than failing. Rules
+  that were cut off are named in a warning, so you know the script was found
+  without them and can raise the limit. `coaes (config :=
+  { maxRuleHeartbeats := n })` sets the per-rule budget in the same unit as
+  `maxHeartbeats` (the default, `0`, means a tenth of the ambient budget).
+
 The closers can be disabled per call with
 `coaes (config := { enableClosers := false })`, per file with
 `erase_coaes_rules [CoAes.BuiltinRules.closeSimp, ...]`, and additional closers

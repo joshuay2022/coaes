@@ -280,10 +280,20 @@ def normSimp (goal : MVarId) (goalMVars : Std.HashSet MVarId) :
   profilingRule .normSimp (wasSuccessful := λ _ => true) do
     checkSimp "norm simp" (mayCloseGoal := true) goal do
       withNormTraceNode .normSimp do
-        try
-          normSimpCore goal goalMVars
-        catch e =>
-          throwError "coaes: error in norm simp: {e.toMessageData}"
+        let preState ← show MetaM _ from saveState
+        tryCatchRuntimeEx
+          (withRuleHeartbeatLimit (← read).options do
+            normSimpCore goal goalMVars)
+          (λ e => do
+            -- Norm simp exceeding a resource limit (e.g. heartbeats) counts
+            -- as "no progress"; normalisation continues with other rules.
+            if isResourceLimitException e then
+              recordResourceLimitedRule .normSimp
+              show MetaM _ from restoreState preState
+              coaes_trace[steps] "norm simp hit a resource limit: {e.toMessageData}"
+              return none
+            else
+              throwError "coaes: error in norm simp: {e.toMessageData}")
 
 def normUnfoldCore (goal : MVarId) : NormM (Option NormRuleResult) := do
   let unfoldRules := (← read).ruleSet.unfoldRules
@@ -309,10 +319,18 @@ def normUnfold (goal : MVarId) : NormM (Option NormRuleResult) := do
   profilingRule .normUnfold (wasSuccessful := λ _ => true) do
     checkSimp "unfold simp" (mayCloseGoal := false) goal do
       withNormTraceNode .normUnfold do
-        try
-          normUnfoldCore goal
-        catch e =>
-          throwError "coaes: error in norm unfold: {e.toMessageData}"
+        let preState ← show MetaM _ from saveState
+        tryCatchRuntimeEx
+          (withRuleHeartbeatLimit (← read).options do
+            normUnfoldCore goal)
+          (λ e => do
+            if isResourceLimitException e then
+              recordResourceLimitedRule .normUnfold
+              show MetaM _ from restoreState preState
+              coaes_trace[steps] "norm unfold hit a resource limit: {e.toMessageData}"
+              return none
+            else
+              throwError "coaes: error in norm unfold: {e.toMessageData}")
 
 inductive NormSeqResult where
   | proved (script : Array (DisplayRuleName × Option (Array Script.LazyStep)))
@@ -438,8 +456,21 @@ def normalizeGoalIfNecessary (gref : GoalRef) [CoAes.Queue Q] :
     forwardRuleMatches := g.forwardRuleMatches
   }
   let ((normResult, { forwardState, forwardRuleMatches, .. }), postState) ←
-    g.runMetaMInParentState do
-      normalizeGoalMVar preGoal g.mvars |>.run normCtx |>.run normState
+    -- A resource limit (e.g. `maxHeartbeats`) hit while normalising counts as
+    -- "normalisation made no progress": the goal is marked normalised (with
+    -- its pre-normalisation state) and the search carries on with it. Letting
+    -- the exception escape would leave the goal un-normalised, which breaks
+    -- the invariants of proof and script extraction.
+    tryCatchRuntimeEx
+      (g.runMetaMInParentState do
+        normalizeGoalMVar preGoal g.mvars |>.run normCtx |>.run normState)
+      (λ e => do
+        unless isResourceLimitException e do
+          throw e
+        recordResourceLimitedRule .normSimp
+        coaes_trace[steps] "Normalisation hit a resource limit: {e.toMessageData}"
+        let postState ← g.runMetaMInParentState (pure ())
+        return ((.unchanged, normState), postState.snd))
   match normResult with
   | .changed postGoal script? =>
     gref.modify λ g =>
